@@ -1,0 +1,16 @@
+# CMake / Pico SDK build tree (includes the fetched picotool and pioasm)
+build/
+build-*/
+
+# Probe output from tools/probe_command8.sh
+c8-probe/
+
+*.uf2
+*.elf
+*.bin
+*.hex
+*.dis
+*.map
+
+__pycache__/
+*.pyc
