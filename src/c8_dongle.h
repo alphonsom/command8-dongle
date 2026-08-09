@@ -31,10 +31,27 @@
 // cables 1..2 = the rear DIN jacks). Matches the 0x0007 masks in the quirk.
 #define C8_NUM_CABLES 3
 
-// ---- Board wiring (Adafruit Feather RP2040 USB Type A Host, #5723) ----------
+// ---- Board wiring -----------------------------------------------------------
+//
+// Defaults suit the Adafruit Feather RP2040 USB Type A Host (#5723), whose
+// Type-A socket is already wired to GPIO 16/17 with 5V switching on GPIO 18.
+// Override from CMake for other boards:
+//
+//   Feather #5723   -DPICO_BOARD=adafruit_feather_rp2040_usb_host   (default)
+//   bare Pico       -DPICO_BOARD=pico -DC8_PIO_USB_DP_PIN=0 -DC8_PIO_USB_VBUS_EN=-1
+//
+// D- is always DP+1 (PIO_USB_PINOUT_DPDM). On a bare Pico, bring D+/D- out to
+// the chosen pins through 22R series resistors, take 5V from VBUS (pin 40) and
+// share a ground. The Command|8 is self-powered, so VBUS only has to be present
+// for connect detection, not to run the unit.
+#ifndef C8_PIO_USB_DP_PIN
+#define C8_PIO_USB_DP_PIN 16
+#endif
 
-#define C8_PIO_USB_DP_PIN  16  // D- is DP+1 = GPIO17
+// GPIO that switches 5V onto the host port, or -1 where VBUS is always on.
+#ifndef C8_PIO_USB_VBUS_EN
 #define C8_PIO_USB_VBUS_EN 18
+#endif
 
 // Pico-PIO-USB needs an integer multiple of 12 MHz; 120 MHz is the documented
 // minimum that leaves headroom for the device stack on core 0.
@@ -55,6 +72,33 @@ typedef struct {
 void c8_host_init(void);
 void c8_host_task(void);
 bool c8_host_ready(void);
+
+// Bring-up telemetry. The dongle has no console unless a UART is wired up, so
+// the host-side state is reported over MIDI instead -- see C8_DEBUG_BEACON.
+typedef enum {
+    C8_HOST_NO_DEVICE = 0,  // nothing has enumerated on the host port
+    C8_HOST_FOREIGN   = 1,  // something enumerated, but not a Full-Speed 0dba:8000
+    C8_HOST_OPEN_FAIL = 2,  // it is the Command|8, but an endpoint would not open
+    C8_HOST_READY     = 3,  // endpoints open, relaying
+} c8_host_state_t;
+
+c8_host_state_t c8_host_state(void);
+uint32_t c8_host_rx_packets(void);
+uint32_t c8_host_mount_count(void);   // increments on every enumeration
+uint32_t c8_host_umount_count(void);  // increments on every drop
+
+// Relay instrumentation: distinguishes "core 1 has hung", "transfers are being
+// refused" and "transfers are accepted but never complete" -- which look
+// identical from the computer's side.
+uint32_t c8_host_ticks(void);      // c8_host_task() calls; frozen = core 1 hung
+uint32_t c8_host_out_tried(void);  // OUT transfers submitted
+uint32_t c8_host_out_done(void);   // OUT completion callbacks
+uint32_t c8_host_out_fail(void);   // OUT submissions refused by tuh_edpt_xfer
+uint32_t c8_host_in_tried(void);   // IN transfers submitted
+uint32_t c8_host_in_done(void);    // IN completion callbacks
+#if C8_PROBE_HID
+uint32_t c8_host_hid_reports(void);  // HID mounts + reports (control experiment)
+#endif
 
 // Relay queues. Single producer / single consumer per direction, and pico_util
 // queues are safe across cores.

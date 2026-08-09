@@ -12,14 +12,25 @@
 #define BOARD_TUD_RHPORT 0
 #define BOARD_TUH_RHPORT 1
 
+#ifndef C8_DEVICE_ONLY
+#define C8_DEVICE_ONLY 0
+#endif
+
 #define CFG_TUD_ENABLED 1
-#define CFG_TUH_ENABLED 1
-
 #define CFG_TUD_MAX_SPEED OPT_MODE_FULL_SPEED
-#define CFG_TUH_MAX_SPEED OPT_MODE_FULL_SPEED
 
+// A device-only build drops the host stack entirely -- including PIO-USB, which
+// TinyUSB's board support pulls in as soon as CFG_TUH_RPI_PIO_USB is set. That
+// is what lets step-1 bring-up run on any Pico with nothing wired up.
+#if C8_DEVICE_ONLY
+#define CFG_TUH_ENABLED 0
+#define CFG_TUH_RPI_PIO_USB 0
+#else
+#define CFG_TUH_ENABLED 1
+#define CFG_TUH_MAX_SPEED OPT_MODE_FULL_SPEED
 // Route the host stack through Pico-PIO-USB on rhport 1.
 #define CFG_TUH_RPI_PIO_USB 1
+#endif
 #define CFG_TUD_RPI_PIO_USB 0
 
 #ifndef CFG_TUSB_MEM_SECTION
@@ -45,6 +56,19 @@
 
 // ---- Host side --------------------------------------------------------------
 
+// REQUIRED. c8_host.c drives the Command|8's endpoints directly with
+// tuh_edpt_open()/tuh_edpt_xfer() rather than through a class driver, and this
+// flag is what makes TinyUSB store and dispatch the per-transfer completion
+// callback (usbh.c: ep_callback is written and read only under this guard).
+//
+// It defaults to 0. With it off the transfers still run to completion on the
+// wire and TinyUSB clears its own busy flag, but the callback is silently
+// discarded because no class driver is bound to these endpoints -- so exactly
+// one transfer is issued in each direction and the relay dies with no error
+// anywhere. Class drivers are unaffected, which is why a HID mouse worked on
+// the same port while the Command|8 did not.
+#define CFG_TUH_API_EDPT_XFER 1
+
 #define CFG_TUH_DEVICE_MAX 1
 #define CFG_TUH_ENDPOINT_MAX 4
 #define CFG_TUH_ENUMERATION_BUFSIZE 256
@@ -60,7 +84,21 @@
 #define CFG_TUH_MIDI   0
 #define CFG_TUH_HUB    0
 #define CFG_TUH_CDC    0
+
+// Diagnostic build only: enables TinyUSB's HID host driver so a spare mouse or
+// keyboard can act as a control experiment. HID uses interrupt IN endpoints,
+// which travel the same completion path as our bulk endpoints -- so if a mouse
+// reports and the Command|8 does not, the fault is in how we open/submit
+// endpoints, not in PIO-USB's ability to deliver non-control completions.
+#ifndef C8_PROBE_HID
+#define C8_PROBE_HID 0
+#endif
+#if C8_PROBE_HID
+#define CFG_TUH_HID    2
+#define CFG_TUH_HID_EPIN_BUFSIZE 64
+#else
 #define CFG_TUH_HID    0
+#endif
 #define CFG_TUH_MSC    0
 #define CFG_TUH_VENDOR 0
 

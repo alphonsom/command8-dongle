@@ -45,12 +45,24 @@ until now only appeared on Windows under the Avid driver.
 
 ## Hardware
 
-Adafruit Feather RP2040 with USB Type A Host (#5723). The host port is already
-wired to GPIO 16/17 with 5V switching on GPIO 18, which is what
-`src/c8_dongle.h` assumes.
+Either board works; the defaults suit the Feather, and the bare Pico is what
+this was actually proven on.
 
-The Command|8 runs from its own AC supply, so the host port only has to satisfy
-connect detection — it is not powering the unit.
+**Adafruit Feather RP2040 with USB Type A Host (#5723)** — host port already
+wired to GPIO 16/17 with 5V switching on GPIO 18, matching the defaults in
+`src/c8_dongle.h`. Build with no extra flags.
+
+**Bare Raspberry Pi Pico + a soldered USB-A socket** — D+ to GP2 (pin 4) and
+D- to GP3 (pin 5), both through 22R series resistors, 5V from VBUS (pin 40),
+ground to pin 3. Avoid GP0/GP1: they are the UART console. PIO-USB drives the
+host pull-downs in software, so no external pull-downs are needed.
+
+```sh
+cmake -B build -DPICO_BOARD=pico -DC8_PIO_USB_DP_PIN=2 -DC8_PIO_USB_VBUS_EN=-1
+```
+
+`-1` means VBUS is always on. The Command|8 runs from its own AC supply, so the
+host port only has to satisfy connect detection — it is not powering the unit.
 
 ## Build
 
@@ -70,9 +82,11 @@ intended to write. A malformed descriptor fails the build.
 Flash by holding BOOTSEL, plugging the Feather into the computer, and copying
 `build/c8_dongle.uf2` to the mounted RPI-RP2 volume.
 
-Diagnostics go to UART, not USB CDC — the native port is the MIDI device.
+Diagnostics go to UART, not USB CDC — the native port is the MIDI device. With
+no UART wired, build `-DC8_DEBUG_BEACON=ON` instead and read the host-side state
+over MIDI on cable 2.
 
-## Before the board arrives
+## Checking the device before you wire anything
 
 Run this on the Linux box with the Command|8 attached:
 
@@ -87,9 +101,47 @@ Anything it flags should be fixed in `src/c8_dongle.h` before you flash.
 `tools/check_descriptors.py` also runs standalone against any captured
 descriptor blob, so it doubles as evidence for the ALSA quirk submission.
 
+## Status
+
+Working end to end on hardware (2026-08-09), on a bare Pico with a USB-A socket
+soldered to GP2/GP3 rather than the Feather:
+
+* The stock Linux class driver accepts the descriptors and creates three named
+  ports; note-on, control change and multi-packet SysEx all round-trip.
+* The Command|8 enumerates over PIO-USB, stays mounted with zero drops, and
+  relays in both directions -- heartbeats inbound, LCD text and Select LEDs
+  outbound.
+* `command8-monitor` drives the surface through **plain ALSA** with no libusb,
+  no kernel quirk and no Digidesign driver:
+  `COMMAND8_BACKEND=alsa command8-monitor --port "Command|8 Surf"` decoded 314
+  fader and 50 encoder events in one 50-second run.
+
+## Gotchas worth knowing
+
+**`CFG_TUH_API_EDPT_XFER` must be 1.** It defaults to 0, and this firmware
+drives the device's endpoints directly with `tuh_edpt_open()`/`tuh_edpt_xfer()`
+rather than through a class driver. That flag is the only thing that makes
+TinyUSB store and dispatch the per-transfer completion callback (`usbh.c`, the
+`ep_callback` read and write are both behind it).
+
+With it off there is **no diagnostic of any kind**: `tuh_edpt_open()` succeeds,
+`tuh_edpt_xfer()` returns true, the transfer runs to completion on the wire and
+TinyUSB clears its own busy flag -- then discards the completion, because no
+class driver is bound to those endpoints. The symptom is exactly one transfer in
+each direction followed by silence, with no error, no stall and no dropped link.
+Class drivers are unaffected, since they use the `ep2drv` path.
+
+**A USB mouse is the best debugging tool here.** With `-DC8_PROBE_HID=ON`,
+plugging a mouse into the host port exercises the same PIO-USB completion path
+through TinyUSB's own HID driver. If the mouse reports and the Command|8 does
+not, the fault is in this firmware, not in PIO-USB, the wiring or the dual-core
+setup. That single control experiment is what found the bug above, after seven
+plausible hypotheses had been eliminated without narrowing anything.
+
 ## Open risks
 
-**~~The host-side enumeration parse.~~ Resolved against hardware.** The worry
+**~~The host-side enumeration parse.~~ Resolved against hardware.** Confirmed
+in practice: the Command|8 enumerates over PIO-USB and stays mounted. The worry
 was that a short `bLength` would desync TinyUSB's descriptor walk and trip
 `TU_ASSERT(TUSB_DESC_INTERFACE == tu_desc_type(p_desc))` in
 `usbh.c :: enum_parse_configuration_desc`, aborting enumeration.
@@ -101,11 +153,14 @@ first descriptor to last, so TinyUSB's parser has nothing to trip over and the
 tolerant-parse patch is not needed. The damage is confined to the jack count
 that one descriptor reports.
 
-**`CFG_TUH_MIDI` must stay 0.** TinyUSB's host config parser special-cases
-Audio-Control + MIDIStreaming into a two-interface association and hands it to
-the MIDI host driver, which would then parse the malformed descriptor and hit
-exactly the failure every OS already hits. `tusb_config.h` disables it with a
-comment saying so; do not turn it on.
+**`CFG_TUH_MIDI` stays 0 -- though not for the reason first assumed.** The
+concern was that TinyUSB's host config parser special-cases Audio-Control +
+MIDIStreaming into a two-interface association and hands it to the MIDI host
+driver, which would then parse the malformed descriptor. In practice the
+TinyUSB vendored with pico-sdk 2.1.1 ships **no MIDI host driver at all** --
+only `class/midi/midi_device.c` -- so there was never a driver to claim the
+interfaces. Enabling it on a newer TinyUSB would reintroduce the original
+concern, and would want testing against the real descriptor first.
 
 **Identity.** The dongle ships as pid.codes `1209:0001`, the "testing only"
 pair — replace it with an allocated PID before distribution. Building with
@@ -128,9 +183,11 @@ to read than either half alone.
 1. **Device side.** Build with `C8_ACCEPT_ANY_DEVICE=0` and nothing in the host
    port. Confirm all three operating systems show three named MIDI ports with no
    driver installed. This proves the descriptors independently.
-2. **Host side.** Plug in the Command|8 and watch UART. Confirm mount, then send
-   the wake message (note 0, velocity 127) from the computer and confirm the
-   surface comes online and fader moves appear.
+2. **Host side.** Build with `-DC8_DEBUG_BEACON=ON` and watch the status on MIDI
+   cable 2 (`aseqdump -p <client>:2`) rather than wiring a UART. Confirm mount,
+   then send the wake (note 0, velocity 127) and confirm heartbeats come back.
+   If nothing moves, reflash with `-DC8_PROBE_HID=ON` and plug in a mouse: that
+   separates "this firmware is wrong" from "the stack is wrong" in one step.
 3. **Together.** Run `command8-monitor` against it on each OS. The loopback demo
    exercises faders, meters, rings and LEDs, which is close to full protocol
    coverage.
