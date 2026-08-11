@@ -3,10 +3,13 @@
 //
 //   Command|8  ==[PIO-USB host, core 1]==>  relay  ==[native USB device, core 0]==>  computer
 //
-// The relay carries 4-byte USB-MIDI event packets verbatim in both directions
-// and knows nothing about the Command|8 protocol. Wake handshake, keepalive and
-// all LED/LCD/ring encoding stay in libcommand8 on the host, where they already
-// work. A dongle that understands nothing is a dongle you debug once.
+// The relay carries 4-byte USB-MIDI event packets verbatim in both directions.
+// The one thing it does understand is the wake/keepalive heartbeat, which it
+// generates itself (see c8_dongle.h) so the surface comes online with no host
+// software behind it. All LED/LCD/ring encoding still lives in libcommand8 on
+// the host, where it already works.
+
+#include <stdio.h>
 
 #include "bsp/board_api.h"
 #include "hardware/clocks.h"
@@ -19,6 +22,8 @@
 #endif
 
 #include "c8_dongle.h"
+#include "c8_midi_pkt.h"
+#include "mcu/c8_mcu.h"
 
 // ---- core 1: the Command|8-facing host --------------------------------------
 
@@ -62,6 +67,142 @@ static void pump_loopback(void) {
 }
 #endif
 
+// ---- core 0: Mackie Control translation -------------------------------------
+//
+// Everything below runs on core 0 only, single threaded. That is what makes it
+// safe without a lock: the translator's state is touched from pump_to_surface()
+// and pump_to_pc(), both of which run in the core 0 loop, and its surface-bound
+// output goes through c8_to_surface_push() -- so core 0 remains that queue's
+// only producer, exactly as before.
+//
+// Cable 0 still carries the raw native protocol in both directions. The
+// translator sits alongside it, reading the same inbound surface traffic and
+// answering on cable 3. Nothing is intercepted, so a host tool on cable 0 and a
+// DAW on cable 3 both work, and either can be ignored.
+
+#if !C8_DEVICE_ONLY && C8_MCU_TRANSLATE
+
+static c8_mcu_t g_mcu;
+static c8_midi_rx_t g_rx_surface;   // reassembles cable 0 traffic from the unit
+static c8_midi_rx_t g_rx_daw;       // reassembles cable 3 traffic from the DAW
+
+// Packets bound for the computer on the MCU cable. A separate ring rather than
+// q_to_pc because that queue's producer is core 1; keeping the contracts
+// unmixed is worth twenty lines.
+#define C8_MCU_RING 64
+static c8_packet_t mcu_ring[C8_MCU_RING];
+static uint16_t mcu_head, mcu_tail;
+static uint32_t mcu_drops;
+
+static void mcu_ring_push(void* user, const uint8_t pkt[4]) {
+    (void)user;
+    const uint16_t next = (uint16_t)((mcu_head + 1) % C8_MCU_RING);
+    if (next == mcu_tail) {   // full: the computer has stopped reading
+        mcu_drops++;
+        return;
+    }
+    memcpy(mcu_ring[mcu_head].b, pkt, 4);
+    mcu_head = next;
+}
+
+static bool mcu_ring_pop(c8_packet_t* p) {
+    if (mcu_tail == mcu_head) return false;
+    *p = mcu_ring[mcu_tail];
+    mcu_tail = (uint16_t)((mcu_tail + 1) % C8_MCU_RING);
+    return true;
+}
+
+// Translator output, one whole MIDI message at a time.
+static void mcu_to_daw(void* user, const uint8_t* msg, size_t len) {
+    (void)user;
+    c8_midi_packetize(msg, len, C8_CABLE_MCU, mcu_ring_push, NULL);
+}
+
+static void surface_pkt_push(void* user, const uint8_t pkt[4]) {
+    (void)user;
+    c8_packet_t p;
+    memcpy(p.b, pkt, 4);
+    c8_to_surface_push(&p);   // full queue drops: stale LED state is worthless
+}
+
+static void mcu_to_surface(void* user, const uint8_t* msg, size_t len) {
+    (void)user;
+    c8_midi_packetize(msg, len, C8_CABLE_SURFACE, surface_pkt_push, NULL);
+}
+
+// Reassembled messages, from each direction.
+static void on_surface_msg(void* user, const uint8_t* msg, size_t len) {
+    (void)user;
+    c8_mcu_from_surface(&g_mcu, msg, len);
+}
+
+static void on_daw_msg(void* user, const uint8_t* msg, size_t len) {
+    (void)user;
+    c8_mcu_from_daw(&g_mcu, msg, len);
+}
+
+static void mcu_init(void) {
+    c8_mcu_init(&g_mcu, mcu_to_daw, mcu_to_surface, NULL);
+    c8_midi_rx_init(&g_rx_surface);
+    c8_midi_rx_init(&g_rx_daw);
+    mcu_head = mcu_tail = 0;
+}
+
+// Drain translator output to the computer. Same hold-and-retry shape as
+// pump_to_pc: a packet that will not fit is kept, not dropped.
+static void pump_mcu_to_pc(void) {
+    static c8_packet_t pending;
+    static bool has_pending = false;
+
+    for (int i = 0; i < 32; i++) {
+        if (!has_pending) {
+            if (!mcu_ring_pop(&pending)) return;
+            has_pending = true;
+        }
+        if (!tud_midi_packet_write(pending.b)) return;
+        has_pending = false;
+    }
+}
+
+uint32_t c8_mcu_drops(void) { return mcu_drops; }
+
+// Meter ballistics. Hosts send meter levels sparsely and expect the surface to
+// fall between updates; without this the meters freeze on the last value when
+// playback stops. 20 ms is well inside the 1200 ms full-scale decay, and the
+// translator only emits rows that actually changed.
+static void mcu_tick(void) {
+    static uint32_t last = 0;
+    const uint32_t now = board_millis();
+    if (now - last < 20) return;
+    last = now;
+    c8_mcu_tick(&g_mcu, now);
+}
+
+// Paint the surface once it is awake. LEDs sent to a sleeping unit are lost, so
+// this waits for the host side to report READY rather than firing at boot.
+//
+// The printf is deliberately only on the transition. stdio goes to UART0 on
+// GPIO 0/1 (where the Raspberry Pi Debug Probe's UART lands), and at 115200 a
+// line costs a few milliseconds during which tud_task() is not running. That is
+// survivable once in a while and emphatically not in the data path -- never add
+// logging to pump_*() or to anything on core 1, where it would stall the
+// bit-banged USB host and drop the bus.
+static void mcu_start_when_ready(void) {
+    static bool started = false;
+    const bool ready = (c8_host_state() == C8_HOST_READY);
+    if (ready && !started) {
+        c8_mcu_start(&g_mcu);
+        started = true;
+        printf("c8: surface ready, MCU translation live on cable %d\n",
+               C8_CABLE_MCU);
+    } else if (!ready && started) {
+        started = false;   // repaint after a replug
+        printf("c8: surface gone\n");
+    }
+}
+
+#endif  // !C8_DEVICE_ONLY && C8_MCU_TRANSLATE
+
 // ---- core 0: the computer-facing device -------------------------------------
 
 #if !C8_DEVICE_ONLY
@@ -80,6 +221,13 @@ static void pump_to_pc(void) {
         if (!has_pending) {
             if (!c8_to_pc_pop(&pending)) return;
             has_pending = true;
+#if C8_MCU_TRANSLATE
+            // Tap, do not intercept: the raw packet still goes to cable 0 below.
+            // The translator sees the same surface traffic and answers on
+            // cable 3, so a host tool and a DAW can both be connected.
+            if ((pending.b[0] >> 4) == C8_CABLE_SURFACE)
+                c8_midi_rx_packet(&g_rx_surface, pending.b, on_surface_msg, NULL);
+#endif
         }
         if (!tud_midi_packet_write(pending.b)) return;
         has_pending = false;
@@ -90,6 +238,16 @@ static void pump_to_pc(void) {
 static void pump_to_surface(void) {
     c8_packet_t p;
     while (tud_midi_packet_read(p.b)) {
+#if C8_MCU_TRANSLATE
+        // Cable 3 is the dongle's own Mackie Control endpoint: consumed and
+        // translated here, never forwarded raw. The Command|8 does not speak
+        // MCU, and forwarding it is precisely the mistake that makes the faders
+        // twitch like level meters.
+        if ((p.b[0] >> 4) == C8_CABLE_MCU) {
+            c8_midi_rx_packet(&g_rx_daw, p.b, on_daw_msg, NULL);
+            continue;
+        }
+#endif
         if (!c8_to_surface_push(&p)) return;  // queue full: let the host retry
     }
 }
@@ -107,6 +265,8 @@ static void pump_to_surface(void) {
 //   CC 123 = c8_host_task() ticks (frozen => core 1 hung)
 //   CC 122/121/120 = OUT submitted / completed / refused
 //   CC 119/118 = IN submitted / completed
+//   CC 116 = wake + keepalive heartbeats sent (should climb once per 4 s)
+//   CC 115 = MCU packets dropped because the computer stopped reading
 //
 // Watch it with:  aseqdump -p <client>:2
 //
@@ -133,6 +293,10 @@ static void beacon(void) {
         {123, c8_host_ticks()},     {122, c8_host_out_tried()},
         {121, c8_host_out_done()},  {120, c8_host_out_fail()},
         {119, c8_host_in_tried()},  {118, c8_host_in_done()},
+        {116, c8_host_hb_sent()},
+#if C8_MCU_TRANSLATE
+        {115, c8_mcu_drops()},
+#endif
 #if C8_PROBE_HID
         {117, c8_host_hid_reports()},
 #endif
@@ -172,6 +336,10 @@ int main(void) {
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
 #endif
 
+#if C8_MCU_TRANSLATE
+    mcu_init();
+#endif
+
     multicore_reset_core1();
     multicore_launch_core1(core1_main);
 #endif
@@ -186,6 +354,11 @@ int main(void) {
 #else
             pump_to_surface();
             pump_to_pc();
+#if C8_MCU_TRANSLATE
+            mcu_start_when_ready();
+            pump_mcu_to_pc();
+            mcu_tick();
+#endif
 #if C8_DEBUG_BEACON
             beacon();
 #endif

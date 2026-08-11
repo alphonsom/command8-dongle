@@ -87,9 +87,10 @@ enum { ITF_NUM_AUDIO_CONTROL = 0, ITF_NUM_MIDI_STREAMING, ITF_NUM_TOTAL };
      + C8_NUM_CABLES * TUD_MIDI_DESC_JACK_LEN                               \
      + 2 * TUD_MIDI_DESC_EP_LEN(C8_NUM_CABLES))
 
-// String indices for the three cables, so the ports arrive named on the host
-// rather than as "MIDI 1 / 2 / 3".
-enum { STRID_CABLE_SURFACE = 4, STRID_CABLE_DIN1, STRID_CABLE_DIN2 };
+// String indices for the cables, so the ports arrive named on the host rather
+// than as "MIDI 1 / 2 / 3 / 4".
+enum { STRID_CABLE_SURFACE = 4, STRID_CABLE_DIN1, STRID_CABLE_DIN2,
+       STRID_CABLE_MCU };
 
 // TUD_MIDI_JACKID_* take 1-based cable numbers.
 uint8_t const desc_configuration[] = {
@@ -100,15 +101,18 @@ uint8_t const desc_configuration[] = {
     TUD_MIDI_DESC_JACK_DESC(1, STRID_CABLE_SURFACE),
     TUD_MIDI_DESC_JACK_DESC(2, STRID_CABLE_DIN1),
     TUD_MIDI_DESC_JACK_DESC(3, STRID_CABLE_DIN2),
+    TUD_MIDI_DESC_JACK_DESC(4, STRID_CABLE_MCU),
 
-    // Bulk OUT: host -> dongle, feeding the three embedded MIDI IN jacks.
+    // Bulk OUT: host -> dongle, feeding the embedded MIDI IN jacks.
     TUD_MIDI_DESC_EP(EPNUM_MIDI_OUT, C8_EP_SIZE, C8_NUM_CABLES),
     TUD_MIDI_JACKID_IN_EMB(1), TUD_MIDI_JACKID_IN_EMB(2), TUD_MIDI_JACKID_IN_EMB(3),
+    TUD_MIDI_JACKID_IN_EMB(4),
 
     // Bulk IN: dongle -> host, fed by the three embedded MIDI OUT jacks.
     // This is the descriptor the Command|8 mis-sizes.
     TUD_MIDI_DESC_EP(EPNUM_MIDI_IN, C8_EP_SIZE, C8_NUM_CABLES),
     TUD_MIDI_JACKID_OUT_EMB(1), TUD_MIDI_JACKID_OUT_EMB(2), TUD_MIDI_JACKID_OUT_EMB(3),
+    TUD_MIDI_JACKID_OUT_EMB(4),
 };
 
 // Caught at compile time rather than by a host that silently refuses to enumerate.
@@ -132,6 +136,9 @@ static char const* string_desc_arr[] = {
     [STRID_CABLE_SURFACE] = "Command|8 Surface",
     [STRID_CABLE_DIN1]    = "Command|8 DIN 1",
     [STRID_CABLE_DIN2]    = "Command|8 DIN 2",
+    // No bar: "Command|8" is how the host tools find the surface, by prefix,
+    // so a barred name here could be matched as the device itself.
+    [STRID_CABLE_MCU]     = "Command8 MCU",
 };
 
 static uint16_t desc_str[32];

@@ -27,9 +27,21 @@
 // Full/Low Speed only, so a High-Speed device here would sink the design.
 #define C8_EP_SIZE 64
 
-// The device exposes three cables each way (cable 0 = control surface,
-// cables 1..2 = the rear DIN jacks). Matches the 0x0007 masks in the quirk.
-#define C8_NUM_CABLES 3
+// Cables presented to the computer. 0..2 mirror the Command|8 itself (control
+// surface, then the two rear DIN jacks) and match the 0x0007 masks in the ALSA
+// quirk. Cable 3 is the dongle's own: a Mackie Control endpoint, translated
+// on board, so a DAW can drive the surface with no host software at all.
+//
+// The MCU cable is deliberately LAST. Cable 0 keeps its meaning, so every
+// existing tool -- command8-monitor, the libusb backend, the ALSA quirk -- goes
+// on working unchanged, and both modes are live at once with no mode switch and
+// no second firmware image.
+#define C8_NUM_CABLES 4
+
+#define C8_CABLE_SURFACE 0
+#define C8_CABLE_DIN1    1
+#define C8_CABLE_DIN2    2
+#define C8_CABLE_MCU     3
 
 // ---- Board wiring -----------------------------------------------------------
 //
@@ -38,12 +50,17 @@
 // Override from CMake for other boards:
 //
 //   Feather #5723   -DPICO_BOARD=adafruit_feather_rp2040_usb_host   (default)
-//   bare Pico       -DPICO_BOARD=pico -DC8_PIO_USB_DP_PIN=0 -DC8_PIO_USB_VBUS_EN=-1
+//   bare Pico       -DPICO_BOARD=pico -DC8_PIO_USB_DP_PIN=2 -DC8_PIO_USB_VBUS_EN=-1
 //
 // D- is always DP+1 (PIO_USB_PINOUT_DPDM). On a bare Pico, bring D+/D- out to
 // the chosen pins through 22R series resistors, take 5V from VBUS (pin 40) and
 // share a ground. The Command|8 is self-powered, so VBUS only has to be present
 // for connect detection, not to run the unit.
+//
+// Do NOT use DP_PIN=0 on a bare Pico: that puts D+/D- on GPIO 0/1, which are
+// UART0's default pins and therefore the console (pico_enable_stdio_uart is on,
+// and the Raspberry Pi Debug Probe's UART lands there). GPIO 2/3 is the wired
+// and tested layout -- see README.md, and keep the two in step.
 #ifndef C8_PIO_USB_DP_PIN
 #define C8_PIO_USB_DP_PIN 16
 #endif
@@ -67,6 +84,25 @@
 typedef struct {
     uint8_t b[4];
 } c8_packet_t;
+
+// ---- Wake / keepalive -------------------------------------------------------
+//
+// The Command|8 powers up Offline and stays there until something sends it
+// note 0 velocity 127, and falls back to Offline if that is not repeated. Until
+// now the host tools did this, which meant the surface was dead without them.
+// The dongle now sends it itself -- once on mount (the wake) and every 4 s
+// after -- so the surface comes online the moment it is plugged in, with no
+// host software at all. That is a precondition for MCU translation living in
+// the dongle, and on its own it removes the most common confusing symptom.
+//
+// Safe even when a host tool is also sending heartbeats: the message is
+// idempotent, and decode_note_on() in libcommand8 maps note 0 vel 127 to a
+// HeartbeatEvent before any other interpretation, so a doubled rate is a no-op.
+// Never send this in reply to an inbound heartbeat -- the device echoes what it
+// receives, and replying would build an echo loop. It is timer-driven only.
+#define C8_HEARTBEAT_MS   4000
+#define C8_HEARTBEAT_NOTE 0
+#define C8_HEARTBEAT_VEL  127
 
 // Host side (core 1). Started once the Command|8 is mounted.
 void c8_host_init(void);
@@ -96,6 +132,7 @@ uint32_t c8_host_out_done(void);   // OUT completion callbacks
 uint32_t c8_host_out_fail(void);   // OUT submissions refused by tuh_edpt_xfer
 uint32_t c8_host_in_tried(void);   // IN transfers submitted
 uint32_t c8_host_in_done(void);    // IN completion callbacks
+uint32_t c8_host_hb_sent(void);    // wake + keepalive heartbeats sent to surface
 #if C8_PROBE_HID
 uint32_t c8_host_hid_reports(void);  // HID mounts + reports (control experiment)
 #endif
