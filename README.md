@@ -33,15 +33,57 @@ dongle is an endpoint on **both** sides:
   carry their own completion callbacks rather than relying on TinyUSB's
   descriptor-derived endpoint binding.
 - **Computer side** — a hand-checked USB-MIDI 1.0 descriptor set in
-  `usb_descriptors.c`, three cables each way.
+  `usb_descriptors.c`, four cables each way.
 
 Nothing in the data path parses a descriptor, so the malformation cannot
-propagate. It also means the dongle knows nothing about the Command|8 protocol:
-the wake handshake, the 4-second keepalive and all LED/LCD/ring encoding stay in
-`libcommand8` on the host, where they already work.
+propagate.
 
-Cable 0 is the control surface. Cables 1 and 2 are the rear DIN jacks, which
-until now only appeared on Windows under the Avid driver.
+### Cables
+
+| Cable | Port name | Carries |
+|-------|-----------|---------|
+| 0 | `Command\|8 Surface` | the control surface, raw native protocol |
+| 1 | `Command\|8 DIN 1` | rear DIN jack |
+| 2 | `Command\|8 DIN 2` | rear DIN jack |
+| 3 | `Command8 MCU` | **Mackie Control, translated on board** |
+
+Cables 1 and 2 only appeared on Windows under the Avid driver until now.
+
+**Port names differ by platform.** ALSA and CoreMIDI use the per-cable jack
+strings above. WinMM ignores them and names cables positionally, so on Windows
+the same four ports appear as:
+
+| Cable | Windows name |
+|-------|--------------|
+| 0 | `Command\|8 Bridge` |
+| 1 | `MIDIIN2 (Command\|8 Bridge)` / `MIDIOUT2 (…)` |
+| 2 | `MIDIIN3 (Command\|8 Bridge)` / `MIDIOUT3 (…)` |
+| 3 | `MIDIIN4 (Command\|8 Bridge)` / `MIDIOUT4 (…)` |
+
+So on Windows the MCU cable is **the fourth port**, not a port called
+`Command8 MCU`. Another reason to keep it last: its position is what identifies
+it there.
+
+Cable 3 is the dongle's own. A DAW pointed at it gets a Mackie Control surface
+with **no host software at all** — no bridge process, no loopback pair, no OSC
+pattern file, on any operating system. The translation is
+[`c8_mcu.c`](https://github.com/alphonsom/command8-cpp), the same C module
+`command8-cpp` builds and unit-tests on the desktop; it is not vendored here,
+because the only place debugging it is cheap is where a debugger works.
+
+The MCU cable is deliberately last, so cable 0 keeps its meaning and every
+existing tool — `command8-monitor`, the libusb backend, the ALSA quirk — works
+unchanged. Both modes are live at once: nothing is intercepted, so a host tool
+on cable 0 and a DAW on cable 3 can be connected at the same time.
+
+Build a plain relay with `-DC8_MCU_TRANSLATE=OFF` if you want the old
+three-cable behaviour.
+
+### What the dongle understands
+
+Only the wake handshake and the 4-second keepalive, which it generates itself so
+the surface comes online the moment it is plugged in, with nothing behind it.
+Everything else it either relays verbatim or hands to the translator.
 
 ## Hardware
 

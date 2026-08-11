@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "tusb.h"
+#include "pico/time.h"
 #include "pico/util/queue.h"
 #include "c8_dongle.h"
 
@@ -41,6 +42,13 @@ static volatile uint32_t mount_count = 0;
 static volatile uint32_t umount_count = 0;
 static volatile uint32_t ticks = 0, out_tried = 0, out_done = 0, out_fail = 0;
 static volatile uint32_t in_tried = 0, in_done = 0;
+static volatile uint32_t hb_sent = 0;
+
+// Wake / keepalive state. Generated on core 1 rather than queued from core 0 so
+// that it works with no host software behind the dongle, and so q_to_surface
+// keeps its single producer.
+static uint32_t last_hb_ms = 0;
+static bool hb_pending = false;
 
 c8_host_state_t c8_host_state(void) { return host_state; }
 uint32_t c8_host_rx_packets(void) { return rx_packets; }
@@ -52,6 +60,7 @@ uint32_t c8_host_out_done(void) { return out_done; }
 uint32_t c8_host_out_fail(void) { return out_fail; }
 uint32_t c8_host_in_tried(void) { return in_tried; }
 uint32_t c8_host_in_done(void) { return in_done; }
+uint32_t c8_host_hb_sent(void) { return hb_sent; }
 
 CFG_TUH_MEM_ALIGN static uint8_t in_buf[C8_EP_SIZE];
 CFG_TUH_MEM_ALIGN static uint8_t out_buf[C8_EP_SIZE];
@@ -130,6 +139,23 @@ static void submit_out(void) {
     if (out_busy || !c8_daddr) return;
 
     uint32_t len = 0;
+
+    // Heartbeat first, so a saturated to-surface queue can never starve the
+    // keepalive and drop the surface Offline. If the endpoint is busy we
+    // returned above with hb_pending still set, and it goes out next pass.
+    if (hb_pending) {
+        static const uint8_t hb[4] = {
+            0x09,                 // cable 0, CIN 0x09 = note-on
+            0x90,                 // note-on, channel 1
+            C8_HEARTBEAT_NOTE,
+            C8_HEARTBEAT_VEL,
+        };
+        memcpy(out_buf, hb, sizeof(hb));
+        len = sizeof(hb);
+        hb_pending = false;
+        hb_sent++;
+    }
+
     c8_packet_t p;
     while (len + 4 <= C8_EP_SIZE && c8_to_surface_pop(&p)) {
         memcpy(&out_buf[len], p.b, 4);
@@ -157,6 +183,14 @@ static void submit_out(void) {
 void c8_host_task(void) {
     ticks++;
     if (!c8_daddr) return;
+
+    // Timer-driven, never a reply to an inbound heartbeat -- see c8_dongle.h.
+    const uint32_t now = to_ms_since_boot(get_absolute_time());
+    if (now - last_hb_ms >= C8_HEARTBEAT_MS) {
+        last_hb_ms = now;
+        hb_pending = true;
+    }
+
     submit_out();
     submit_in();  // no-op while one is already in flight
 }
@@ -215,6 +249,12 @@ void tuh_mount_cb(uint8_t daddr) {
 
     c8_daddr = daddr;
     in_busy = out_busy = false;
+
+    // Wake the surface immediately, then let c8_host_task() keep it online. The
+    // first c8_host_task() pass after this sends it, within a millisecond.
+    hb_pending = true;
+    last_hb_ms = to_ms_since_boot(get_absolute_time());
+
     submit_in();
 }
 
@@ -223,5 +263,6 @@ void tuh_umount_cb(uint8_t daddr) {
     if (daddr != c8_daddr) return;
     c8_daddr = 0;
     in_busy = out_busy = false;
+    hb_pending = false;   // do not fire a stale wake at whatever mounts next
     host_state = C8_HOST_NO_DEVICE;
 }
