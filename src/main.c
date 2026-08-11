@@ -89,7 +89,16 @@ static c8_midi_rx_t g_rx_daw;       // reassembles cable 3 traffic from the DAW
 // Packets bound for the computer on the MCU cable. A separate ring rather than
 // q_to_pc because that queue's producer is core 1; keeping the contracts
 // unmixed is worth twenty lines.
-#define C8_MCU_RING 64
+//
+// Sized to match the raw relay queue rather than picked independently. It was
+// 64, and that overflowed on hardware during a single fader sweep: snd-usb-audio
+// does not drain the IN endpoint while no application holds the port, so
+// tud_midi_packet_write() fails, the ring backs up and everything after the
+// first 64 packets is lost -- which silently swallowed a whole encoder gesture
+// that arrived behind the sweep. A fader sweep alone is ~150 packets, so 64 was
+// never enough. Found only because c8_mcu_drops() is on the beacon; keep it
+// there.
+#define C8_MCU_RING C8_QUEUE_DEPTH
 static c8_packet_t mcu_ring[C8_MCU_RING];
 static uint16_t mcu_head, mcu_tail;
 static uint32_t mcu_drops;
