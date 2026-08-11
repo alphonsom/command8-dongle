@@ -49,20 +49,24 @@ propagate.
 
 Cables 1 and 2 only appeared on Windows under the Avid driver until now.
 
-**Port names differ by platform.** ALSA and CoreMIDI use the per-cable jack
-strings above. WinMM ignores them and names cables positionally, so on Windows
-the same four ports appear as:
+**Port names differ by platform**, which matters when telling a DAW which port
+to use. ALSA and CoreMIDI both read the per-cable jack strings; WinMM ignores
+them entirely and names cables by position. All three verified on hardware:
 
-| Cable | Windows name |
-|-------|--------------|
-| 0 | `Command\|8 Bridge` |
-| 1 | `MIDIIN2 (Command\|8 Bridge)` / `MIDIOUT2 (…)` |
-| 2 | `MIDIIN3 (Command\|8 Bridge)` / `MIDIOUT3 (…)` |
-| 3 | `MIDIIN4 (Command\|8 Bridge)` / `MIDIOUT4 (…)` |
+| OS | How the MCU cable (3) appears |
+|----|-------------------------------|
+| Linux (ALSA) | `Command\|8 Bridge Command8 MCU` |
+| macOS (CoreMIDI) | `command8-cpp - Command\|8 Bridge - Command8 MCU` |
+| Windows (WinMM) | `MIDIIN4 (Command\|8 Bridge)` / `MIDIOUT4 (…)` |
 
-So on Windows the MCU cable is **the fourth port**, not a port called
-`Command8 MCU`. Another reason to keep it last: its position is what identifies
-it there.
+CoreMIDI composes manufacturer, product and jack name; ALSA uses product plus
+jack name; WinMM uses the product name with a positional prefix and no jack
+string at all.
+
+So **on Windows the MCU cable is identified only by being the fourth port** —
+there is nothing called `Command8 MCU` to look for. That is a further reason to
+keep it last: position is the only handle Windows gives you. The other three
+cables follow the same pattern (`Command\|8 Bridge`, then `MIDIIN2`/`MIDIIN3`).
 
 Cable 3 is the dongle's own. A DAW pointed at it gets a Mackie Control surface
 with **no host software at all** — no bridge process, no loopback pair, no OSC
