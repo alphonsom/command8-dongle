@@ -83,6 +83,21 @@ on cable 0 and a DAW on cable 3 can be connected at the same time.
 Build a plain relay with `-DC8_MCU_TRANSLATE=OFF` if you want the old
 three-cable behaviour.
 
+### Status LED
+
+The board LED is lit while the Command|8 is enumerated and relaying, and dark
+otherwise, in every build. It answers the only question the dongle cannot
+otherwise report without a UART: is the surface actually up?
+
+**The Feather has two LEDs and only one of them is ours.** The red LED marked
+`13` is this indicator. The green one marked `5V` is a power-rail indicator, lit
+whenever the board has power, and says nothing about firmware. A bare Pico has
+only the one. Watch the red one.
+
+The LED does not distinguish a beacon build from a normal one -- both drive it
+the same way. For that, look for beacon frames on cable 2
+(`aseqdump -p <client>:2`).
+
 ### What the dongle understands
 
 Only the wake handshake and the 4-second keepalive, which it generates itself so

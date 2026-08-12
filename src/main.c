@@ -22,8 +22,15 @@
 #endif
 
 #include "c8_dongle.h"
+
+// The translator and its packet codec are only compiled in for a dual-role
+// build with translation enabled -- and only then does CMake put c8_mcu.h on
+// the include path, so this guard is load-bearing, not tidiness. Without it the
+// C8_DEVICE_ONLY bring-up build fails to compile.
+#if !C8_DEVICE_ONLY && C8_MCU_TRANSLATE
 #include "c8_midi_pkt.h"
 #include "mcu/c8_mcu.h"
+#endif
 
 // ---- core 1: the Command|8-facing host --------------------------------------
 
@@ -315,10 +322,46 @@ static void beacon(void) {
         tud_midi_packet_write(pk);
     }
 
+}
+#endif
+
+// ---- status LED -------------------------------------------------------------
+//
+// Lit while the Command|8 is enumerated and relaying, dark otherwise. Driven in
+// EVERY build, not just the beacon one: without a UART this is the dongle's only
+// indicator, and "is the surface actually up?" is the question worth answering.
+//
+// Driven explicitly, including OFF at boot, so the pin is never left floating
+// and the state always means something. TinyUSB's board_init() will not do it
+// for us -- it only touches an LED when the BSP defines LED_PIN, which the
+// pico-sdk integration does not.
+//
+// **The Feather has two LEDs.** The red one (GPIO 13) is this status indicator;
+// the green one marked 5V is a power rail indicator, lit whenever the board has
+// power and nothing to do with firmware. On a bare Pico there is only the one.
+// So "an LED is lit" is not a firmware signal on the Feather -- look at the red
+// one specifically. This cost a wrong diagnosis once.
+//
+// The LED cannot distinguish the beacon build from the normal one; both drive
+// it identically. Use the beacon's own output for that: `aseqdump -p <client>:2`
+// shows frames, or it does not.
 #ifdef PICO_DEFAULT_LED_PIN
-    gpio_put(PICO_DEFAULT_LED_PIN, st == C8_HOST_READY);
+static void led_init(void) {
+    gpio_init(PICO_DEFAULT_LED_PIN);
+    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
+    gpio_put(PICO_DEFAULT_LED_PIN, 0);
+}
+
+static void led_update(void) {
+#if C8_DEVICE_ONLY
+    gpio_put(PICO_DEFAULT_LED_PIN, tud_midi_mounted());
+#else
+    gpio_put(PICO_DEFAULT_LED_PIN, c8_host_state() == C8_HOST_READY);
 #endif
 }
+#else
+static void led_init(void) {}
+static void led_update(void) {}
 #endif
 
 int main(void) {
@@ -340,10 +383,7 @@ int main(void) {
     gpio_put(C8_PIO_USB_VBUS_EN, 1);
 #endif
 
-#if C8_DEBUG_BEACON && defined(PICO_DEFAULT_LED_PIN)
-    gpio_init(PICO_DEFAULT_LED_PIN);
-    gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
-#endif
+    led_init();   // explicitly OFF until the surface is relaying
 
 #if C8_MCU_TRANSLATE
     mcu_init();
@@ -357,6 +397,13 @@ int main(void) {
 
     for (;;) {
         tud_task();
+
+        // Outside the mounted check on purpose: the LED reports the Command|8's
+        // state, which is independent of whether a computer is attached. A
+        // powered dongle with the surface connected should show it even with
+        // nothing plugged into the other end.
+        led_update();
+
         if (tud_midi_mounted()) {
 #if C8_DEVICE_ONLY
             pump_loopback();
